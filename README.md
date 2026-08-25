@@ -44,12 +44,23 @@ One command. It clones or updates `~/.local/share/local-image-gen`, puts `local-
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DandreYang/local-image-gen/main/install.sh | bash
-local-image-gen --list-providers
+local-image-gen doctor
 ```
 
 If `~/.local/bin` is not on your PATH, the installer prints the one `export` to add.
 
+Tagged releases: [v0.1.5](https://github.com/DandreYang/local-image-gen/releases/tag/v0.1.5) ([all releases](https://github.com/DandreYang/local-image-gen/releases)).
+
 From a git checkout, `./install.sh` uses that checkout instead of cloning again. The installer only creates symlinks; it will not replace an existing real skill directory.
+
+Already installed:
+
+```bash
+local-image-gen doctor    # backends, Dyro, and whether main is newer
+local-image-gen update    # git pull --ff-only, then refresh the wrapper and skill links
+```
+
+`update` refuses a dirty checkout, a tree whose git status cannot be read, a non-git copy, a non-official `origin`, and any branch other than `main`/`master`. It only runs `git pull --ff-only origin main`. It does not run `curl | bash`. Generate commands never check GitHub for a new version. `LOCAL_IMAGE_GEN_SKIP_UPDATE_CHECK=1` skips the doctor freshness GET (Dyro's 5s spawn should set this).
 
 ## Optional Dyro
 
@@ -57,7 +68,7 @@ This project does **not** require [Dyro](https://github.com/DandreYang/DyroEngin
 
 If you run it inside a Dyro workspace (an ancestor `dyro.toml`) and omit `-o` / `--out-dir`, images go to `<workspace>/outputs/images` so they stay out of `repositories/` and task worktrees. `-o` always wins.
 
-`local-image-gen --doctor` reports backends and whether a Dyro CLI or workspace is present. It does not generate an image.
+`local-image-gen doctor` reports backends, whether a Dyro CLI or workspace is present, and whether this install is behind `main`. It does not generate an image. `--doctor` is an alias.
 
 ## Usage
 
@@ -68,7 +79,7 @@ python3 scripts/local_image_gen.py --list-models
 
 # Auto: prefer the current harness login, then any other login, then official keys
 python3 scripts/local_image_gen.py "minimal tech cover, no text" \
-  --aspect-ratio 16:9 --quality high -o outputs/cover.png
+  --aspect-ratio 16:9 --quality high --optimize auto -o outputs/cover.png
 
 # Grok Imagine 2.0 via grok login
 python3 scripts/local_image_gen.py "cinematic night city" \
@@ -85,6 +96,7 @@ python3 scripts/local_image_gen.py "clean product still" \
   --provider openai --model gpt-image-2 --aspect-ratio 1:1 -o outputs/still.png
 
 # Diagnose without spending quota
+python3 scripts/local_image_gen.py doctor
 python3 scripts/local_image_gen.py "test" --dry-run --aspect-ratio 1:1
 ```
 
@@ -103,9 +115,27 @@ Agents that have the skill installed should run `scripts/local_image_gen.py` ins
 | `openai` | `gpt-image-2` | — | `OPENAI_API_KEY` |
 | `xai` | `grok-imagine-image-2.0` | — | `XAI_API_KEY` |
 
-`auto` without a Nano Banana model prefers Grok, then Antigravity, then Codex. Cursor is only used for the Nano Banana family, or when you pass `--provider cursor`.
+`auto` without a named model family prefers Grok, then Codex, then Antigravity (`agy`), then Cursor. A named Nano Banana model still uses Antigravity → Cursor → `GEMINI_API_KEY`. The current harness login still wins when it is usable.
 
 Parameter mapping lives in [`references/providers.md`](references/providers.md). `--list-models` is the executable catalog.
+
+## Prompts
+
+Most people (and most coding agents) do not write a production image prompt. The CLI will not silently rewrite you.
+
+| Flag | What it does |
+| --- | --- |
+| `--raw` | Send the prompt unchanged |
+| `--prompt-profile cover\|poster\|portrait\|product\|edit` | Wrap a short request in a deterministic template. No extra model call |
+| `--optimize auto` | Compile short/generic prompts, and remap a prompt written for a different image family. Family-matched text model (Grok login / official keys). Frozen system prompt, no tools, no `agy`/`cursor-agent` |
+| `--optimize on` | Always compile for the target family, unless `--raw` or `--provider codex`. Use this when switching Imagine ↔ Nano Banana |
+| `--optimize off` | Default. Transport the prompt as given |
+
+`--dry-run --optimize auto` can call the **text** model so you can read `prompt.used` without spending an image. The JSON always includes `prompt.original`, `prompt.used`, and `prompt.optimize`. If you omit `-o`, the default filename hash is the original prompt.
+
+Grammar and examples: [`references/prompts.md`](references/prompts.md).
+
+`--mask` is official OpenAI Images inpaint only (`--provider openai`). Grok Imagine edits take at most 3 reference images.
 
 ## Configuration
 
@@ -124,7 +154,9 @@ CLI override for one request: `--base-url` / `--api-base`. Subscriptions ignore 
 
 ```bash
 python3 tests/test_local_image_gen.py
+python3 tests/test_prompt_compile.py
 python3 scripts/local_image_gen.py --version
+python3 scripts/local_image_gen.py doctor
 ```
 
 No third-party Python dependencies.

@@ -44,12 +44,23 @@ Python 3.9+，只用标准库。既可以当 CLI，也可以当 Claude / Codex /
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/DandreYang/local-image-gen/main/install.sh | bash
-local-image-gen --list-providers
+local-image-gen doctor
 ```
 
 如果 `~/.local/bin` 不在 PATH 里，安装脚本会打印需要加的那一行 `export`。
 
+带标签的发布： [v0.1.5](https://github.com/DandreYang/local-image-gen/releases/tag/v0.1.5)（[全部 Release](https://github.com/DandreYang/local-image-gen/releases)）。
+
 已经 clone 过的话，在仓库里跑 `./install.sh` 会用当前目录，不会再下一份。安装脚本只建符号链接，不会覆盖已有的实体 skill 目录。
+
+已经装过：
+
+```bash
+local-image-gen doctor    # 后端、Dyro，以及 main 是否更新
+local-image-gen update    # git pull --ff-only，再刷新包装脚本和 skill 链接
+```
+
+`update` 遇到脏工作区、读不了 git status、不是 git 仓库、origin 不是官方 GitHub、或不在 `main`/`master` 会拒绝。它只跑 `git pull --ff-only origin main`。不会再跑 `curl | bash`。生图命令不会去 GitHub 查新版本。`LOCAL_IMAGE_GEN_SKIP_UPDATE_CHECK=1` 会跳过 doctor 的新鲜度 GET（Dyro 的 5 秒 spawn 应设置此项）。
 
 ## 可选的 Dyro
 
@@ -57,7 +68,7 @@ local-image-gen --list-providers
 
 如果在 Dyro 工作区里运行（上级目录有 `dyro.toml`），又没传 `-o` / `--out-dir`，图片会写到 `<workspace>/outputs/images`，避免落到 `repositories/` 或任务 worktree 里。`-o` 始终优先。
 
-`local-image-gen --doctor` 会报告后端，以及是否检测到 Dyro CLI / 工作区，不会真正生图。
+`local-image-gen doctor` 会报告后端、是否检测到 Dyro CLI / 工作区，以及这份安装是否落后于 `main`。不会真正生图。`--doctor` 是别名。
 
 ## 用法
 
@@ -66,7 +77,7 @@ python3 scripts/local_image_gen.py --list-providers
 python3 scripts/local_image_gen.py --list-models
 
 python3 scripts/local_image_gen.py "极简科技封面，无文字" \
-  --aspect-ratio 16:9 --quality high -o outputs/cover.png
+  --aspect-ratio 16:9 --quality high --optimize auto -o outputs/cover.png
 
 python3 scripts/local_image_gen.py "电影感城市夜景" \
   --provider grok --model grok-imagine-image-2.0 \
@@ -79,6 +90,7 @@ python3 scripts/local_image_gen.py "水彩狐狸在雪林里" \
 python3 scripts/local_image_gen.py "干净的产品静物" \
   --provider openai --model gpt-image-2 --aspect-ratio 1:1 -o outputs/still.png
 
+python3 scripts/local_image_gen.py doctor
 python3 scripts/local_image_gen.py "test" --dry-run --aspect-ratio 1:1
 ```
 
@@ -97,9 +109,27 @@ python3 scripts/local_image_gen.py "test" --dry-run --aspect-ratio 1:1
 | `openai` | `gpt-image-2` | — | `OPENAI_API_KEY` |
 | `xai` | `grok-imagine-image-2.0` | — | `XAI_API_KEY` |
 
-未指定 Nano Banana 模型时，`auto` 优先 Grok，然后 Antigravity，再 Codex。Cursor 只加入 Nano Banana 链路，或在你写 `--provider cursor` 时使用。
+未点名模型族时，`auto` 优先 Grok，然后 Codex，再 Antigravity（`agy`），再 Cursor。点名 Nano Banana 时仍是 Antigravity → Cursor → `GEMINI_API_KEY`。当前 harness 已登录且可用时，仍优先走当前 harness。
 
 参数对照见 [`references/providers.md`](references/providers.md)。模型清单以 `--list-models` 为准。
+
+## 提示词
+
+多数人和多数编程助手不会写生产级生图提示词。CLI **不会**默认改写你的原文。
+
+| 参数 | 作用 |
+| --- | --- |
+| `--raw` | 原文直送 |
+| `--prompt-profile cover\|poster\|portrait\|product\|edit` | 用确定性模板包一层，不调文本模型 |
+| `--optimize auto` | 短/空泛提示词会编译；上一张图若是另一家的成品提示词，也会按目标家族重适配。同族文本模型（`grok login` 或官方 Key），冻结系统提示，无工具，不拉起 `agy` / `cursor-agent` |
+| `--optimize on` | 总是按目标家族编译；`--raw` 和 `--provider codex` 除外。Imagine 与 Nano Banana 互转要用这个 |
+| `--optimize off` | 默认。原文传输 |
+
+`--dry-run --optimize auto` 可以只打文本模型，看 JSON 里的 `prompt.used`，不消耗生图配额。每次结果都带 `prompt.original` / `prompt.used` / `prompt.optimize`。省略 `-o` 时，默认文件名的 hash 用的是原文。
+
+写法见 [`references/prompts.md`](references/prompts.md)。
+
+`--mask` 只支持官方 OpenAI Images 局部重绘（`--provider openai`）。Grok Imagine 编辑最多 3 张参考图。
 
 ## 配置
 
@@ -118,7 +148,9 @@ Key 和可选自定义 base，进程环境之后按下面顺序取第一个：
 
 ```bash
 python3 tests/test_local_image_gen.py
+python3 tests/test_prompt_compile.py
 python3 scripts/local_image_gen.py --version
+python3 scripts/local_image_gen.py doctor
 ```
 
 没有第三方 Python 依赖。

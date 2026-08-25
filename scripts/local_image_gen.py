@@ -25,10 +25,30 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-__version__ = "0.1.1"
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from prompt_compile import (  # noqa: E402
+    OPTIMIZE_MODES,
+    PROMPT_PROFILES,
+    PromptCompileResult,
+    apply_profile,
+    build_optimize_messages,
+    decide_optimize,
+    default_text_model,
+    detect_prompt_format,
+    fallback_prompt,
+    preferred_text_backends,
+    prompt_family,
+    sanitize_optimized_prompt,
+)
+
+__version__ = "0.1.5"
 
 CODEX_AUTH_PATH = Path("~/.codex/auth.json").expanduser()
 GROK_AUTH_PATH = Path("~/.grok/auth.json").expanduser()
@@ -36,7 +56,7 @@ GROK_AUTH_PATH = Path("~/.grok/auth.json").expanduser()
 CODEX_RESPONSES_ENDPOINT = "https://chatgpt.com/backend-api/codex/responses"
 CODEX_REFRESH_ENDPOINT = "https://auth.openai.com/oauth/token"
 CODEX_REFRESH_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"
-CODEX_RESPONSE_MODEL = os.environ.get("CODEX_RESPONSE_MODEL", "gpt-5.5")
+CODEX_RESPONSE_MODEL = os.environ.get("CODEX_RESPONSE_MODEL", "gpt-5.6-terra")
 
 GROK_REFRESH_ENDPOINT = "https://auth.x.ai/oauth2/token"
 GROK_DEFAULT_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -62,6 +82,8 @@ API_BASE_ENV_NAMES = {
 }
 
 REQUEST_TIMEOUT = 300
+OPTIMIZE_TIMEOUT = 25
+GROK_MAX_REFERENCE_IMAGES = 3
 TOKEN_EXPIRY_SKEW_SECONDS = 60
 DEFAULT_OUTPUT_STEM = "local-generated-image"
 DYRO_TOML_NAME = "dyro.toml"
@@ -98,6 +120,8 @@ GROK_ASPECTS = set(SUPPORTED_ASPECTS)
 GEMINI_ASPECTS = set(SUPPORTED_ASPECTS)
 
 PROVIDERS = ("auto", "grok", "codex", "gemini", "antigravity", "agy", "cursor", "openai", "xai")
+# Generic --provider auto when the user did not name a model family.
+AUTO_PROVIDER_ORDER = ("grok", "codex", "antigravity", "cursor", "gemini", "xai", "openai")
 PROVIDER_ALIASES = {"agy": "antigravity"}
 QUALITY_CHOICES = ("auto", "low", "medium", "high")
 RESOLUTION_CHOICES = ("1k", "2k", "4k")
@@ -182,6 +206,12 @@ ENV_KEY_NAMES = {
 }
 
 SIZE_PATTERN = re.compile(r"^(auto|\d+x\d+)$", re.IGNORECASE)
+PUBLISHED_VERSION_RE = re.compile(r'^__version__\s*=\s*["\']([^"\']+)["\']', re.M)
+REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+
+DEFAULT_REPO_SLUG = "DandreYang/local-image-gen"
+UPDATE_CHECK_TIMEOUT = 2
+META_COMMANDS = ("doctor", "update")
 ASPECT_PATTERN = re.compile(
     r"^\s*(?:(?P<w>\d+(?:\.\d+)?)\s*[:/x]\s*(?P<h>\d+(?:\.\d+)?)|(?P<name>[A-Za-z][A-Za-z0-9_-]*))\s*$"
 )
@@ -484,6 +514,17 @@ def iso_expired(value: str, *, now: Optional[dt.datetime] = None) -> bool:
     return current.timestamp() >= (stamp.timestamp() - TOKEN_EXPIRY_SKEW_SECONDS)
 
 
+SECRET_QUERY_RE = re.compile(r"([?&](?:key|api_key|access_token)=)[^&\s]+", re.IGNORECASE)
+BEARER_RE = re.compile(r"(Bearer\s+)\S+", re.IGNORECASE)
+USERINFO_RE = re.compile(r"(https?://)[^/\s]+@", re.IGNORECASE)
+
+
+def redact_secrets(text: str) -> str:
+    out = SECRET_QUERY_RE.sub(r"\1***", text)
+    out = BEARER_RE.sub(r"\1***", out)
+    return USERINFO_RE.sub(r"\1***@", out)
+
+
 def http_request(
     url: str,
     *,
@@ -505,13 +546,277 @@ def http_request(
             if not text.strip():
                 return response.status, {}, header_map
             return response.status, json.loads(text), header_map
+    except TimeoutError as exc:
+        raise ImageGenError("Request timed out.") from exc
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
         raise ImageGenError(f"HTTP {exc.code}: {raw.strip() or exc.reason}") from exc
     except urllib.error.URLError as exc:
         raise ImageGenError(f"Network error: {exc.reason}") from exc
     except json.JSONDecodeError as exc:
-        raise ImageGenError(f"Non-JSON response from {url}: {exc}") from exc
+        raise ImageGenError(f"Non-JSON response from {redact_secrets(url)}: {exc}") from exc
+
+
+def package_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_share_home() -> Path:
+    override = os.environ.get("LOCAL_IMAGE_GEN_HOME", "").strip()
+    if override:
+        return Path(os.path.expanduser(override)).resolve()
+    return (Path.home() / ".local" / "share" / "local-image-gen").resolve()
+
+
+def install_source(root: Path) -> str:
+    try:
+        if root.resolve() == default_share_home():
+            return "share"
+    except OSError:
+        pass
+    return "checkout"
+
+
+def repo_slug() -> str:
+    slug = os.environ.get("LOCAL_IMAGE_GEN_REPO", DEFAULT_REPO_SLUG).strip() or DEFAULT_REPO_SLUG
+    if not REPO_SLUG_RE.fullmatch(slug):
+        raise ImageGenError("LOCAL_IMAGE_GEN_REPO must be owner/name.")
+    return slug
+
+
+def latest_version_url(slug: Optional[str] = None) -> str:
+    return f"https://raw.githubusercontent.com/{slug or repo_slug()}/main/scripts/local_image_gen.py"
+
+
+def strip_remote_userinfo(url: str) -> str:
+    return USERINFO_RE.sub(r"\1", (url or "").strip()).rstrip("/")
+
+
+def origin_is_official(url: str, slug: Optional[str] = None) -> bool:
+    text = strip_remote_userinfo(url)
+    escaped = re.escape(slug or repo_slug())
+    return bool(
+        re.fullmatch(
+            rf"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/){escaped}(?:\.git)?",
+            text,
+            re.IGNORECASE,
+        )
+    )
+
+
+def parse_published_version(text: str) -> Optional[str]:
+    match = PUBLISHED_VERSION_RE.search(text or "")
+    return match.group(1) if match else None
+
+
+def installed_version(root: Path) -> str:
+    script = root / "scripts" / "local_image_gen.py"
+    try:
+        text = script.read_text(encoding="utf-8")
+    except OSError:
+        return __version__
+    return parse_published_version(text) or __version__
+
+
+def version_tuple(text: str) -> Tuple[int, ...]:
+    parts: List[int] = []
+    for item in (text or "").split("."):
+        if item.isdigit():
+            parts.append(int(item))
+        else:
+            break
+    return tuple(parts) or (0,)
+
+
+def version_is_newer(remote: str, local: str) -> bool:
+    return version_tuple(remote) > version_tuple(local)
+
+
+def update_check_enabled() -> bool:
+    flag = os.environ.get("LOCAL_IMAGE_GEN_SKIP_UPDATE_CHECK", "").strip().lower()
+    return flag not in {"1", "true", "yes", "on"}
+
+
+def fetch_latest_version() -> str:
+    url = latest_version_url()
+    status, raw, _headers = http_request(
+        url,
+        method="GET",
+        timeout=UPDATE_CHECK_TIMEOUT,
+        expect_json=False,
+    )
+    if status != 200:
+        raise ImageGenError(f"Version check HTTP {status}.")
+    text = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+    version = parse_published_version(text)
+    if not version:
+        raise ImageGenError("Remote script did not contain __version__.")
+    return version
+
+
+def git_run(root: Path, *args: str, timeout: int = 60) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(
+            ["git", "-C", str(root), *args],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except FileNotFoundError as exc:
+        raise ImageGenError("git is required for local-image-gen update.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ImageGenError("git timed out.") from exc
+
+
+def git_output(root: Path, *args: str, timeout: int = 60) -> str:
+    proc = git_run(root, *args, timeout=timeout)
+    if proc.returncode != 0:
+        err = redact_secrets((proc.stderr or proc.stdout or "git failed").strip())
+        raise ImageGenError(err or "git failed")
+    return proc.stdout
+
+
+def inspect_install(root: Optional[Path] = None) -> Dict[str, Any]:
+    resolved = (root or package_root()).resolve()
+    git = (resolved / ".git").exists()
+    dirty: Optional[bool] = None
+    if git:
+        try:
+            dirty = bool(git_output(resolved, "status", "--porcelain", timeout=5).strip())
+        except ImageGenError:
+            dirty = None
+    return {
+        "version": installed_version(resolved),
+        "latest": None,
+        "update_available": None,
+        "root": str(resolved),
+        "source": install_source(resolved),
+        "git": git,
+        "dirty": dirty,
+        "check_error": None,
+    }
+
+
+def attach_latest_version(info: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        latest = fetch_latest_version()
+    except ImageGenError as exc:
+        info["latest"] = None
+        info["update_available"] = None
+        info["check_error"] = str(exc)
+        return info
+    info["latest"] = latest
+    info["update_available"] = version_is_newer(latest, str(info.get("version") or ""))
+    info["check_error"] = None
+    return info
+
+
+def doctor_payload(loaded_files: Sequence[Path]) -> Dict[str, Any]:
+    workspace = find_dyro_workspace()
+    output_dir, _detected = default_image_dir()
+    install = inspect_install()
+    if update_check_enabled():
+        attach_latest_version(install)
+    else:
+        install["check_error"] = "skipped"
+    return {
+        "success": True,
+        "command": "doctor",
+        "version": __version__,
+        "cli": "local-image-gen",
+        "harness": detect_harness(),
+        "install": install,
+        "dyro": {
+            "optional": True,
+            "cli": dyro_cli_version(),
+            "workspace": str(workspace) if workspace else None,
+            "workspace_name": dyro_workspace_name(workspace) if workspace else None,
+            "output_dir": str(output_dir),
+        },
+        "providers": list_provider_status(loaded_files),
+    }
+
+
+def _run_installer(root: Path, *, dry_run: bool) -> str:
+    installer = root / "install.sh"
+    if not installer.is_file():
+        raise ImageGenError(f"missing {installer}")
+    cmd = ["bash", str(installer)]
+    if dry_run:
+        cmd.append("--dry-run")
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(root),
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except FileNotFoundError as exc:
+        raise ImageGenError("bash is required for local-image-gen update.") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise ImageGenError("install.sh timed out.") from exc
+    output = redact_secrets((proc.stdout or proc.stderr or "").strip())
+    if proc.returncode != 0:
+        raise ImageGenError(output or "install.sh failed")
+    return output
+
+
+def run_update(*, dry_run: bool = False) -> Dict[str, Any]:
+    root = package_root()
+    before = inspect_install(root)
+    if update_check_enabled():
+        attach_latest_version(before)
+    if not before["git"]:
+        raise ImageGenError(
+            f"Not a git checkout: {root}. Re-run the official installer from "
+            f"https://github.com/{DEFAULT_REPO_SLUG}"
+        )
+    if before["dirty"] is True:
+        raise ImageGenError(
+            f"Working tree is dirty: {root}. Commit or stash, or update "
+            f"{default_share_home()} instead."
+        )
+    if before["dirty"] is not False:
+        raise ImageGenError(
+            f"Could not determine whether {root} is clean. Refusing to update."
+        )
+    origin = git_output(root, "remote", "get-url", "origin").strip()
+    if not origin_is_official(origin):
+        raise ImageGenError(
+            f"origin is not github.com/{repo_slug()}. Refusing to update."
+        )
+    branch = git_output(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+    if branch not in {"main", "master"}:
+        raise ImageGenError(
+            f"Refusing to update branch {branch!r}. Checkout main first."
+        )
+    pull_args = ["pull", "--ff-only", "origin", "main" if branch == "main" else branch]
+    if dry_run:
+        pull_args.append("--dry-run")
+    pull = git_run(root, *pull_args, timeout=120)
+    pull_out = redact_secrets((pull.stdout or pull.stderr or "").strip())
+    if pull.returncode != 0:
+        raise ImageGenError(pull_out or "git pull --ff-only failed")
+    installer_out = _run_installer(root, dry_run=dry_run)
+    after = inspect_install(root)
+    after["latest"] = before.get("latest")
+    latest = after.get("latest")
+    if latest:
+        after["update_available"] = version_is_newer(str(latest), str(after.get("version") or ""))
+    after["check_error"] = before.get("check_error")
+    return {
+        "success": True,
+        "command": "update",
+        "dry_run": dry_run,
+        "from": before["version"],
+        "to": after["version"],
+        "install": after,
+        "steps": [
+            {"step": "git pull --ff-only", "dry_run": dry_run, "output": pull_out},
+            {"step": "install.sh", "dry_run": dry_run, "output": installer_out},
+        ],
+    }
 
 
 def guess_mime(path: Path) -> str:
@@ -564,6 +869,53 @@ def load_local_image_bytes(source: str) -> Tuple[bytes, str]:
     if not path.is_file():
         raise ImageGenError(f"Image not found: {path}")
     return path.read_bytes(), guess_mime(path)
+
+
+def suffix_for_mime(mime: str) -> str:
+    return {"image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}.get(mime, ".png")
+
+
+def materialize_image_file(source: str, directory: Path, index: int) -> Path:
+    raw, mime = load_local_image_bytes(source)
+    target = directory / f"input-{index}{suffix_for_mime(mime)}"
+    target.write_bytes(raw)
+    return target
+
+
+def encode_multipart(
+    fields: Dict[str, Any],
+    file_fields: Sequence[Tuple[str, Path]],
+) -> Tuple[str, bytes]:
+    boundary = f"----local-image-gen-{uuid.uuid4().hex}"
+    chunks: List[bytes] = []
+    for name, value in fields.items():
+        if value is None:
+            continue
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    for field_name, path in file_fields:
+        filename = path.name
+        content_type = guess_mime(path)
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                (
+                    f'Content-Disposition: form-data; name="{field_name}"; '
+                    f'filename="{filename}"\r\n'
+                ).encode("utf-8"),
+                f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+                path.read_bytes(),
+                b"\r\n",
+            ]
+        )
+    chunks.append(f"--{boundary}--\r\n".encode("utf-8"))
+    return boundary, b"".join(chunks)
 
 
 def unique_output_path(path: Path, overwrite: bool) -> Path:
@@ -1470,7 +1822,14 @@ def grok_image_payload(
     resolution: Optional[str],
     n: int,
     images: Sequence[str],
+    base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Build the xAI /images/generations body.
+
+    The official Imagine API takes ``aspect_ratio`` and rejects a pixel
+    ``size`` (HTTP 400). Custom OpenAI-compatible bases may ignore the ratio
+    and default to 16:9, so only those get an explicit pixel ``size``.
+    """
     payload: Dict[str, Any] = {
         "model": model,
         "prompt": prompt,
@@ -1479,7 +1838,8 @@ def grok_image_payload(
     }
     if aspect:
         payload["aspect_ratio"] = aspect
-        payload["size"] = pixel_size_for_aspect(aspect, resolution)
+        if base_url and base_url.rstrip("/") != GROK_API_BASE:
+            payload["size"] = pixel_size_for_aspect(aspect, resolution)
     if quality and model == "grok-imagine-image-2.0":
         payload["quality"] = quality
     if resolution:
@@ -1507,7 +1867,7 @@ def run_grok(
     dry_run: bool,
     base_url: Optional[str] = None,
 ) -> Dict[str, Any]:
-    payload = grok_image_payload(prompt, model, aspect, quality, resolution, n, images)
+    payload = grok_image_payload(prompt, model, aspect, quality, resolution, n, images, base_url)
     endpoint = f"{(base_url or GROK_API_BASE).rstrip('/')}/{'images/edits' if images else 'images/generations'}"
     if dry_run:
         return {
@@ -1659,10 +2019,14 @@ def run_gemini(
 
     if not api_key:
         raise ImageGenError("Gemini API key is missing.")
-    url = f"{api_root}/models/{model}:generateContent?key={urllib.parse.quote(api_key)}"
+    url = f"{api_root}/models/{model}:generateContent"
     _, payload, _ = http_request(
         url,
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-goog-api-key": api_key,
+        },
         body=json.dumps({"contents": contents, "generationConfig": generation_config}).encode("utf-8"),
     )
 
@@ -1704,6 +2068,7 @@ def run_openai_compat(
     output: Path,
     overwrite: bool,
     dry_run: bool,
+    mask: Optional[Path] = None,
 ) -> Dict[str, Any]:
     endpoint = f"{base_url}/{'images/edits' if images else 'images/generations'}"
     body: Dict[str, Any] = {
@@ -1714,6 +2079,11 @@ def run_openai_compat(
         "quality": quality,
     }
     if dry_run:
+        request = dict(body)
+        if images and provider != "xai":
+            request["transport"] = "multipart"
+            request["image_count"] = len(images)
+            request["mask"] = str(mask) if mask else None
         return {
             "success": True,
             "dry_run": True,
@@ -1721,13 +2091,12 @@ def run_openai_compat(
             "auth": "api_key",
             "model": model,
             "endpoint": endpoint,
-            "request": body,
+            "request": request,
             "images": list(images),
             "output": str(output),
         }
     if images:
-        # OpenAI-compatible edits: send JSON with data URLs when talking to xAI Imagine,
-        # otherwise fall back to JSON-only prompt+image_url style used by many proxies.
+        # xAI Imagine edits stay JSON. Official OpenAI Images edits are multipart.
         if provider == "xai":
             payload = grok_image_payload(prompt, model, None, None if quality == "auto" else quality, None, n, images)
             payload["size"] = size
@@ -1741,20 +2110,24 @@ def run_openai_compat(
                 body=json.dumps(payload).encode("utf-8"),
             )
         else:
-            _, response, _ = http_request(
-                endpoint,
-                headers={
-                    "Authorization": f"Bearer {api_key}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json",
-                },
-                body=json.dumps(
-                    {
-                        **body,
-                        "image": normalize_image_source(images[0]),
-                    }
-                ).encode("utf-8"),
-            )
+            with tempfile.TemporaryDirectory(prefix="local-image-gen-edit-") as tmp:
+                tmpdir = Path(tmp)
+                file_fields: List[Tuple[str, Path]] = [
+                    ("image", materialize_image_file(source, tmpdir, index))
+                    for index, source in enumerate(images)
+                ]
+                if mask:
+                    file_fields.append(("mask", mask))
+                boundary, payload = encode_multipart(body, file_fields)
+                _, response, _ = http_request(
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": f"multipart/form-data; boundary={boundary}",
+                        "Accept": "application/json",
+                    },
+                    body=payload,
+                )
     else:
         _, response, _ = http_request(
             endpoint,
@@ -1907,7 +2280,7 @@ def choose_auto_provider(model: Optional[str], loaded_files: Sequence[Path]) -> 
         )
     if harness and usable(harness):
         return harness
-    for name in ("grok", "antigravity", "codex", "cursor", "gemini", "xai", "openai"):
+    for name in AUTO_PROVIDER_ORDER:
         if usable(name):
             return name
     raise ImageGenError(
@@ -1928,14 +2301,432 @@ def resolve_provider(requested: str, model: Optional[str], loaded_files: Sequenc
     return choose_auto_provider(model, loaded_files)
 
 
+def extract_chat_text(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        raise ImageGenError("Prompt compiler returned a non-object.")
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0]
+        if isinstance(first, dict):
+            message = first.get("message")
+            if isinstance(message, dict) and isinstance(message.get("content"), str):
+                return message["content"]
+            if isinstance(first.get("text"), str):
+                return first["text"]
+    raise ImageGenError("Prompt compiler returned no text.")
+
+
+def extract_gemini_text(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        raise ImageGenError("Prompt compiler returned a non-object.")
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        raise ImageGenError("Gemini prompt compiler returned no text.")
+    chunks: List[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("thought") is True:
+                return
+            text = node.get("text")
+            if isinstance(text, str) and text.strip():
+                chunks.append(text)
+            for key, value in node.items():
+                if key in {"text", "thought"}:
+                    continue
+                walk(value)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(candidates)
+    if chunks:
+        return "\n".join(chunks)
+    raise ImageGenError("Gemini prompt compiler returned no text.")
+
+
+def grok_optimize_token(loaded_files: Sequence[Path], base_override: Optional[str]) -> Optional[Dict[str, str]]:
+    if grok_auth_available():
+        return {"provider": "grok", "auth": "subscription", "token": "", "base_url": GROK_API_BASE}
+    key = first_env(ENV_KEY_NAMES["xai"], loaded_files)
+    if not key:
+        return None
+    base, _source = resolve_api_base("xai", loaded_files, base_override)
+    return {"provider": "grok", "auth": "api_key", "token": key, "base_url": base}
+
+
+def openai_optimize_token(loaded_files: Sequence[Path], base_override: Optional[str]) -> Optional[Dict[str, str]]:
+    key = first_env(ENV_KEY_NAMES["openai"], loaded_files)
+    if not key:
+        return None
+    base, _source = resolve_api_base("openai", loaded_files, base_override)
+    return {"provider": "openai", "auth": "api_key", "token": key, "base_url": base}
+
+
+def gemini_optimize_token(loaded_files: Sequence[Path], base_override: Optional[str]) -> Optional[Dict[str, str]]:
+    key = first_env(ENV_KEY_NAMES["gemini"], loaded_files)
+    if not key:
+        return None
+    base, _source = resolve_api_base("gemini", loaded_files, base_override)
+    return {"provider": "gemini", "auth": "api_key", "token": key, "base_url": base}
+
+
+def _optimize_base_override(text_backend: str, image_provider: str, override: Optional[str]) -> Optional[str]:
+    if not override:
+        return None
+    if text_backend == "grok" and image_provider in {"grok", "xai"}:
+        return override
+    if text_backend == "openai" and image_provider == "openai":
+        return override
+    if text_backend == "gemini" and image_provider == "gemini":
+        return override
+    return None
+
+
+def list_optimize_backends(
+    family: str,
+    loaded_files: Sequence[Path],
+    *,
+    allow_missing_preferred: bool,
+    image_provider: str,
+    base_override: Optional[str],
+) -> List[Dict[str, str]]:
+    resolvers = {
+        "grok": grok_optimize_token,
+        "openai": openai_optimize_token,
+        "gemini": gemini_optimize_token,
+    }
+    order = preferred_text_backends(family)
+    available: List[Dict[str, str]] = []
+    for name in order:
+        try:
+            resolved = resolvers[name](
+                loaded_files, _optimize_base_override(name, image_provider, base_override)
+            )
+        except ImageGenError:
+            continue
+        if resolved:
+            available.append(resolved)
+    if not available:
+        return []
+    preferred_name = order[0]
+    preferred = [item for item in available if item["provider"] == preferred_name]
+    others = [item for item in available if item["provider"] != preferred_name]
+    if preferred:
+        return preferred + others
+    if allow_missing_preferred:
+        return others
+    return []
+
+
+def resolve_optimize_token(backend: Dict[str, str]) -> Dict[str, str]:
+    if backend.get("provider") == "grok" and backend.get("auth") == "subscription":
+        token, _auth = refresh_grok_auth()
+        resolved = dict(backend)
+        resolved["token"] = token
+        return resolved
+    return backend
+
+
+def invoke_optimize_model(
+    backend: Dict[str, str],
+    family: str,
+    system: str,
+    user: str,
+    model_override: Optional[str] = None,
+) -> Tuple[str, str]:
+    backend = resolve_optimize_token(backend)
+    provider = backend["provider"]
+    preferred = preferred_text_backends(family)[0]
+    model = default_text_model(
+        provider,
+        model_override,
+        allow_override=provider == preferred,
+    )
+    if provider in {"grok", "openai"}:
+        endpoint = f"{backend['base_url'].rstrip('/')}/chat/completions"
+        body: Dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            "temperature": 0.35,
+            "max_tokens": 500,
+        }
+        # grok-4.6 defaults to high reasoning and can stall a 2-5 sentence compile.
+        if provider == "grok" and "grok-4." in model:
+            body["reasoning_effort"] = "low"
+        if provider == "openai" and "gpt-5.6" in model:
+            body["reasoning_effort"] = "low"
+        _, payload, _ = http_request(
+            endpoint,
+            headers={
+                "Authorization": f"Bearer {backend['token']}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            body=json.dumps(body).encode("utf-8"),
+            timeout=OPTIMIZE_TIMEOUT,
+        )
+        return extract_chat_text(payload), model
+    api_root = backend["base_url"].rstrip("/")
+    url = f"{api_root}/models/{model}:generateContent"
+    _, payload, _ = http_request(
+        url,
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "x-goog-api-key": backend["token"],
+        },
+        body=json.dumps(
+            {
+                "contents": [{"role": "user", "parts": [{"text": f"{system}\n\n---\n\n{user}"}]}],
+                "generationConfig": {"temperature": 0.35, "maxOutputTokens": 500},
+            }
+        ).encode("utf-8"),
+        timeout=OPTIMIZE_TIMEOUT,
+    )
+    return extract_gemini_text(payload), model
+
+
+def compile_job_prompt(
+    args: argparse.Namespace,
+    provider: str,
+    aspect: Optional[str],
+    images: Sequence[str],
+    loaded_files: Sequence[Path],
+) -> PromptCompileResult:
+    original = str(args.prompt).strip()
+    profile = getattr(args, "prompt_profile", None)
+    optimize_mode = getattr(args, "optimize", "off") or "off"
+    raw = bool(getattr(args, "raw", False))
+    from_file = bool(getattr(args, "prompt_from_file", False))
+    family = prompt_family(provider)
+    source_format = detect_prompt_format(original)
+    notes: List[str] = []
+
+    if raw and (profile or optimize_mode != "off"):
+        notes.append("--raw sent the prompt verbatim and ignored --prompt-profile / --optimize.")
+
+    should, skipped = decide_optimize(
+        optimize_mode,
+        original,
+        raw=raw,
+        from_file=from_file,
+        provider=provider,
+    )
+    adapt_reason = None
+    if should and skipped == "family_mismatch":
+        adapt_reason = "family_mismatch"
+        notes.append(
+            f"Re-adapting a {source_format} prompt for {family} ({provider})."
+        )
+        skipped = None
+    if skipped == "codex_response_model" and optimize_mode != "off":
+        notes.append("Skipped --optimize on Codex; that path already rewrites via the response model.")
+
+    if not should:
+        used = original if raw else fallback_prompt(original, profile, aspect, family)
+        return PromptCompileResult(
+            original,
+            used,
+            profile=None if raw else profile,
+            optimize_mode=optimize_mode,
+            applied=False,
+            skipped_reason=skipped,
+            family=family,
+            source_format=source_format,
+            notes=notes,
+        )
+
+    backends = list_optimize_backends(
+        family,
+        loaded_files,
+        allow_missing_preferred=optimize_mode == "on",
+        image_provider=provider,
+        base_override=getattr(args, "base_url", None),
+    )
+    if not backends:
+        if optimize_mode == "on":
+            raise ImageGenError(
+                "--optimize on needs a text backend: grok login / XAI_API_KEY, "
+                "OPENAI_API_KEY, or GEMINI_API_KEY. It will not launch agy or cursor-agent."
+            )
+        notes.append("Skipped --optimize auto; no family-matched text backend is available.")
+        used = fallback_prompt(original, profile, aspect, family)
+        return PromptCompileResult(
+            original,
+            used,
+            profile=profile,
+            optimize_mode=optimize_mode,
+            applied=False,
+            skipped_reason="no_text_backend",
+            family=family,
+            source_format=source_format,
+            adapt_reason=adapt_reason,
+            notes=notes,
+        )
+
+    preferred = preferred_text_backends(family)[0]
+    system, user = build_optimize_messages(
+        original,
+        family=family,
+        edit=bool(images),
+        aspect=aspect,
+        profile=None if raw else profile,
+        image_count=len(images),
+    )
+    last_error: Optional[str] = None
+    last_backend: Optional[Dict[str, str]] = None
+    last_model: Optional[str] = None
+    for backend in backends:
+        last_backend = backend
+        if backend["provider"] != preferred:
+            notes.append(
+                f"Optimize trying {backend['provider']} text; preferred family backend is {preferred}."
+            )
+        try:
+            raw_text, model = invoke_optimize_model(
+                backend, family, system, user, getattr(args, "optimize_model", None)
+            )
+        except ImageGenError as exc:
+            last_error = redact_secrets(str(exc))
+            last_model = None
+            notes.append(f"{backend['provider']} optimize failed: {last_error}")
+            continue
+        last_model = model
+        compiled = sanitize_optimized_prompt(raw_text)
+        if compiled:
+            return PromptCompileResult(
+                original,
+                compiled,
+                profile=profile,
+                optimize_mode=optimize_mode,
+                applied=True,
+                family=family,
+                text_model=model,
+                text_provider=backend["provider"],
+                source_format=source_format,
+                adapt_reason=adapt_reason,
+                notes=notes,
+            )
+        last_error = "compiler output was empty or a refusal"
+        notes.append(f"{backend['provider']} optimize returned unusable text.")
+
+    if optimize_mode == "on":
+        raise ImageGenError(f"Prompt optimize failed: {last_error or 'no usable text'}")
+    notes.append(f"Skipped --optimize auto after text-model errors: {last_error or 'no usable text'}")
+    used = fallback_prompt(original, profile, aspect, family)
+    return PromptCompileResult(
+        original,
+        used,
+        profile=profile,
+        optimize_mode=optimize_mode,
+        applied=False,
+        skipped_reason="optimize_failed",
+        family=family,
+        text_model=last_model,
+        text_provider=last_backend["provider"] if last_backend else None,
+        source_format=source_format,
+        adapt_reason=adapt_reason,
+        notes=notes,
+    )
+
+
+def attach_prompt_meta(
+    result: Dict[str, Any],
+    compiled: PromptCompileResult,
+    workspace: Optional[Path],
+    notes: Optional[Sequence[str]] = None,
+) -> Dict[str, Any]:
+    result["prompt_original"] = compiled.original
+    result["prompt_used"] = compiled.used
+    result["prompt"] = compiled.as_dict()
+    return attach_workspace(result, workspace, list(notes or []) + compiled.notes)
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Generate or edit images via local subscriptions or official API keys.")
+    tokens = list(sys.argv[1:] if argv is None else argv)
+    command: Optional[str] = None
+    if tokens and tokens[0] in META_COMMANDS:
+        command = tokens[0]
+        tokens = tokens[1:]
+    if command == "update":
+        return parse_update_args(tokens)
+    if command == "doctor":
+        return parse_doctor_args(tokens)
+    return parse_job_args(tokens)
+
+
+def parse_update_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="local-image-gen update",
+        description="Fast-forward this git checkout and refresh the CLI wrapper and skill links.",
+    )
+    parser.add_argument("--version", action="version", version=f"local-image-gen {__version__}")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show the git pull and installer steps without changing files.",
+    )
+    args = parser.parse_args(list(argv))
+    args.command = "update"
+    args.doctor = False
+    args.list_providers = False
+    args.list_models = False
+    args.prompt = None
+    return args
+
+
+def parse_doctor_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="local-image-gen doctor",
+        description="Report backends, optional Dyro detection, and whether this install is behind main.",
+    )
+    parser.add_argument("--version", action="version", version=f"local-image-gen {__version__}")
+    parser.add_argument("--doctor", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args(list(argv))
+    args.command = "doctor"
+    args.doctor = True
+    args.list_providers = False
+    args.list_models = False
+    args.prompt = None
+    args.dry_run = False
+    return args
+
+
+def parse_job_args(argv: Sequence[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Generate or edit images via local subscriptions or official API keys.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Tool commands:\n"
+            "  local-image-gen doctor            Diagnose backends and install freshness\n"
+            "  local-image-gen update            Fast-forward this install\n"
+            "  local-image-gen update --dry-run  Show the update steps only\n"
+        ),
+    )
     parser.add_argument("--version", action="version", version=f"local-image-gen {__version__}")
     parser.add_argument("prompt", nargs="?", help="Image prompt.")
     parser.add_argument("-p", "--prompt-file", type=Path, help="Read the prompt from a UTF-8 file.")
     parser.add_argument("-o", "--output", type=Path, help="Output image path.")
     parser.add_argument("--out-dir", type=Path, help="Output directory when --output is omitted.")
     parser.add_argument("-i", "--image", "--reference-image", action="append", dest="images", default=[], help="Reference/edit image. Repeatable.")
+    parser.add_argument("--mask", type=Path, help="PNG mask for OpenAI inpaint. Transparent regions are edited. Only --provider openai.")
+    parser.add_argument("--raw", action="store_true", help="Send the prompt verbatim. Skips --prompt-profile and --optimize.")
+    parser.add_argument(
+        "--prompt-profile",
+        choices=PROMPT_PROFILES,
+        help="Wrap a short prompt in a deterministic asset template: cover, poster, portrait, product, edit.",
+    )
+    parser.add_argument(
+        "--optimize",
+        choices=OPTIMIZE_MODES,
+        default="off",
+        help="Compile the prompt for the target image family. Default off. auto rewrites short/generic prompts and remaps a prompt written for a different family.",
+    )
+    parser.add_argument("--optimize-model", help="Override the text model used by --optimize.")
     parser.add_argument("--provider", choices=PROVIDERS, default="auto")
     parser.add_argument("--model", help="Image model id or alias.")
     parser.add_argument("--aspect-ratio", "--aspect", dest="aspect_ratio", help="Aspect ratio such as 16:9, 9:16, square, landscape, portrait.")
@@ -1957,24 +2748,35 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--doctor",
         action="store_true",
-        help="Report backends and optional Dyro detection. Does not generate an image.",
+        help="Alias for the doctor command. Prefer: local-image-gen doctor.",
     )
-    args = parser.parse_args(argv)
-    if args.list_providers or args.list_models or args.doctor:
+    args = parser.parse_args(list(argv))
+    if args.doctor:
+        args.command = "doctor"
+        return args
+    if args.list_providers or args.list_models:
+        args.command = "list"
         return args
     if args.prompt and args.prompt_file:
         parser.error("Use either a prompt argument or --prompt-file, not both.")
+    args.prompt_from_file = False
     if args.prompt_file:
         args.prompt = args.prompt_file.expanduser().read_text(encoding="utf-8")
+        args.prompt_from_file = True
     if not args.prompt or not str(args.prompt).strip():
-        parser.error("A prompt is required unless --list-providers, --list-models, or --doctor is set.")
+        parser.error("A prompt is required unless doctor, update, --list-providers, or --list-models is used.")
     args.prompt = str(args.prompt).strip()
+    if args.mask:
+        args.mask = args.mask.expanduser()
+        if not args.mask.is_file():
+            parser.error(f"Mask file not found: {args.mask}")
     if args.n < 1 or args.n > 10:
         parser.error("--n must be between 1 and 10.")
     if args.size and args.aspect_ratio:
         parser.error("Use either --size or --aspect-ratio, not both.")
     if args.size and not SIZE_PATTERN.match(args.size):
         parser.error("--size must be auto or WIDTHxHEIGHT.")
+    args.command = "generate"
     return args
 
 
@@ -2022,6 +2824,18 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
     notes: List[str] = []
     output, workspace = prepare_output(args)
     images = list(args.images or [])
+    mask = getattr(args, "mask", None)
+    if mask and provider != "openai":
+        raise ImageGenError("--mask is only supported with --provider openai.")
+    if mask and not images:
+        raise ImageGenError("--mask requires at least one --image.")
+    if provider in {"grok", "xai"} and len(images) > GROK_MAX_REFERENCE_IMAGES:
+        raise ImageGenError(
+            f"Grok Imagine accepts at most {GROK_MAX_REFERENCE_IMAGES} reference images."
+        )
+
+    compiled = compile_job_prompt(args, provider, aspect, images, loaded_files)
+    prompt = compiled.used
 
     if provider == "grok":
         grok_quality, grok_resolution, map_notes = map_grok_quality(args.quality, args.resolution)
@@ -2038,7 +2852,7 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
             token, auth_mode = key or "dry-run", "api_key"
             grok_base, _source = resolve_api_base("xai", loaded_files, getattr(args, "base_url", None))
         result = run_grok(
-            args.prompt,
+            prompt,
             model,
             aspect,
             grok_quality,
@@ -2052,7 +2866,7 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
             args.dry_run,
             grok_base,
         )
-        return attach_workspace(result, workspace, notes)
+        return attach_prompt_meta(result, compiled, workspace, notes)
 
     if provider == "codex":
         if not (codex_auth_available() or args.dry_run):
@@ -2061,19 +2875,20 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
         quality = "high" if args.quality == "auto" and args.resolution in {"2k", "4k"} else args.quality
         if quality == "auto":
             quality = "medium"
-        return attach_workspace(
+        return attach_prompt_meta(
             run_codex(
-                args.prompt, model, size, quality, images, output, args.overwrite, args.dry_run, aspect
+                prompt, model, size, quality, images, output, args.overwrite, args.dry_run, aspect
             ),
+            compiled,
             workspace,
             notes,
         )
 
     if provider == "antigravity":
         image_size = map_gemini_image_size(args.quality, args.resolution)
-        return attach_workspace(
+        return attach_prompt_meta(
             run_antigravity(
-                args.prompt,
+                prompt,
                 model,
                 aspect,
                 image_size,
@@ -2082,15 +2897,16 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
                 args.overwrite,
                 args.dry_run,
             ),
+            compiled,
             workspace,
             notes,
         )
 
     if provider == "cursor":
         image_size = map_gemini_image_size(args.quality, args.resolution)
-        return attach_workspace(
+        return attach_prompt_meta(
             run_cursor(
-                args.prompt,
+                prompt,
                 model,
                 aspect,
                 image_size,
@@ -2099,6 +2915,7 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
                 args.overwrite,
                 args.dry_run,
             ),
+            compiled,
             workspace,
             notes,
         )
@@ -2111,9 +2928,9 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
                 "Gemini API key is missing. Use --provider antigravity after `agy` login, or set GEMINI_API_KEY."
             )
         gemini_base, _source = resolve_api_base("gemini", loaded_files, getattr(args, "base_url", None))
-        return attach_workspace(
+        return attach_prompt_meta(
             run_gemini(
-                args.prompt,
+                prompt,
                 model,
                 aspect,
                 image_size,
@@ -2124,6 +2941,7 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
                 args.dry_run,
                 gemini_base,
             ),
+            compiled,
             workspace,
             notes,
         )
@@ -2141,7 +2959,7 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
             notes.extend(map_notes)
             token = api_key or "dry-run"
             result = run_grok(
-                args.prompt,
+                prompt,
                 model,
                 aspect,
                 grok_quality,
@@ -2156,11 +2974,11 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
                 key_base,
             )
             result["provider"] = "xai"
-            return attach_workspace(result, workspace, notes)
-        return attach_workspace(
+            return attach_prompt_meta(result, compiled, workspace, notes)
+        return attach_prompt_meta(
             run_openai_compat(
                 provider,
-                args.prompt,
+                prompt,
                 model,
                 size,
                 quality,
@@ -2171,7 +2989,9 @@ def run_job(args: argparse.Namespace) -> Dict[str, Any]:
                 output,
                 args.overwrite,
                 args.dry_run,
+                mask if provider == "openai" else None,
             ),
+            compiled,
             workspace,
             notes,
         )
@@ -2194,26 +3014,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.list_models:
         print_json({"success": True, "models": list_models_payload()})
         return 0
+    if getattr(args, "command", None) == "update":
+        try:
+            print_json(run_update(dry_run=bool(getattr(args, "dry_run", False))))
+        except ImageGenError as exc:
+            fail(str(exc))
+            return 1
+        return 0
     if args.doctor:
-        workspace = find_dyro_workspace()
-        output_dir, _detected = default_image_dir()
-        print_json(
-            {
-                "success": True,
-                "command": "doctor",
-                "version": __version__,
-                "cli": "local-image-gen",
-                "harness": detect_harness(),
-                "dyro": {
-                    "optional": True,
-                    "cli": dyro_cli_version(),
-                    "workspace": str(workspace) if workspace else None,
-                    "workspace_name": dyro_workspace_name(workspace) if workspace else None,
-                    "output_dir": str(output_dir),
-                },
-                "providers": list_provider_status(loaded_files),
-            }
-        )
+        print_json(doctor_payload(loaded_files))
         return 0
     try:
         result = run_job(args)

@@ -4,7 +4,7 @@ Thanks for helping. Keep the project small and honest.
 
 ## Rules
 
-- Standard library only in `scripts/local_image_gen.py`.
+- Standard library only in `scripts/local_image_gen.py` and `scripts/prompt_compile.py`.
 - API-key defaults must stay official vendor hosts. Custom bases are explicit (`--base-url` or `*_BASE_URL`).
 - Do not add a named third-party proxy as a provider.
 - Do not print tokens, keys, or auth files.
@@ -15,7 +15,9 @@ Thanks for helping. Keep the project small and honest.
 
 ```bash
 python3 tests/test_local_image_gen.py
+python3 tests/test_prompt_compile.py
 python3 scripts/local_image_gen.py --list-providers
+python3 scripts/local_image_gen.py doctor
 python3 scripts/local_image_gen.py "probe" --provider openai --dry-run
 ```
 

@@ -36,21 +36,31 @@
 | --- | --- |
 | CLI | PATH 上的包装命令 `local-image-gen` → `scripts/local_image_gen.py` |
 | 官方安装 | `https://raw.githubusercontent.com/DandreYang/local-image-gen/main/install.sh` |
-| 探测 JSON | `local-image-gen --doctor` |
+| 探测 JSON | `local-image-gen doctor`（`--doctor` 仍可用） |
 | 工作区默认产出 | 祖先目录有 `dyro.toml` 且未传 `-o`/`--out-dir` 时，写到 `<workspace>/outputs/images` |
 | 不依赖 `dyro` 二进制 | `find_dyro_workspace()` 只认 `dyro.toml` |
 
 Dyro 只认 PATH 上的 `local-image-gen` 包装命令。仅有 skill 目录、没有 wrapper 的机器算 `absent`。不要为了发现它去扫用户 skill 目录。
 
-`--doctor` 成功时是**恰好一份 JSON**，形状如下（路径字段视为本机敏感信息，**禁止原样透传到 Dyro 默认输出**）：
+`local-image-gen doctor` 成功时是**恰好一份 JSON**（`--doctor` 别名相同），形状如下（路径字段视为本机敏感信息，**禁止原样透传到 Dyro 默认输出**）：
 
 ```json
 {
   "success": true,
   "command": "doctor",
-  "version": "0.1.1",
+  "version": "0.1.4",
   "cli": "local-image-gen",
   "harness": "grok",
+  "install": {
+    "version": "0.1.4",
+    "latest": null,
+    "update_available": null,
+    "root": "/Users/you/.local/share/local-image-gen",
+    "source": "share",
+    "git": true,
+    "dirty": false,
+    "check_error": "skipped"
+  },
   "dyro": {
     "optional": true,
     "cli": "dyro 0.7.4",
@@ -69,7 +79,7 @@ Dyro 只认 PATH 上的 `local-image-gen` 包装命令。仅有 skill 目录、�
 }
 ```
 
-已登录时，上游 `providers[].login` 可能是 auth 文件路径。`--doctor` 本身是读文件/环境，不发起计费出图。
+已登录时，上游 `providers[].login` 可能是 auth 文件路径。`install.root` / `dyro.workspace` 同样是本机路径。`doctor` 仍不发起计费出图；交互式 `doctor` 可能对 `raw.githubusercontent.com` 做一次短 GET（`urlopen(timeout=2)`，**不含 DNS 墙钟**），并可能跑 `git status`。
 
 判定「可用」：`success == true` 且 `providers` 里至少一行 `subscription == true` 或 `api_key == true`。  
 CLI 在 PATH 上但没有任何后端，算 `needs_setup`，不是失败。
@@ -126,7 +136,7 @@ dyro image install [--dry-run] [--yes]
 
 - `doctor`：
   - PATH 上没有 wrapper：打印安装来源；JSON 为 `state=absent`，进程退出码仍为 0
-  - 有：跑 `local-image-gen --doctor`，超时 ≤ 5s，stdin 关掉，只收一份 JSON，再**归一化**（见 §4.1）
+  - 有：跑 `local-image-gen doctor`（或 `--doctor`），stdin 关掉，只收一份 JSON，再**归一化**（见 §4.1）。**必须**带 `LOCAL_IMAGE_GEN_SKIP_UPDATE_CHECK=1`，这样 spawn 才可能压在 5s 内：跳过 GitHub GET，也不要把 `urlopen(timeout=2)` 当成 DNS 截止。需要新鲜度时让用户自己跑交互式 `doctor` / `update --dry-run`，不要在 5s sidecar 里查 `main`。doctor 失败不得非零到「工作区损坏」；sidecar 自己可以 `unavailable`。
   - 解析失败、超时、非 0：`state=unavailable`，不要让整个 Dyro 工作区 doctor 失败；本命令可非 0，但文案是「sidecar 不可读」，不是工作区损坏
 - `install`：对齐 `dyro tool install` 里 **remote_script_only** 的工具（Cursor / Hermes）：
   - 打印官方仓库与 install.sh URL
@@ -137,7 +147,7 @@ dyro image install [--dry-run] [--yes]
 
 `dyro --dry-run image doctor` 与 `dyro --dry-run image install` 都不得 spawn sidecar、不得打开浏览器。这是**新增**纪律：`cmd_doctor` 今天并不看全局 `--dry-run`，不要把「git 只读体检仍会跑」理解成「可以跑 sidecar」。
 
-安装完成后用户自己跑 `local-image-gen --doctor`；Dyro 只再探测 PATH。
+安装完成后用户自己跑 `local-image-gen doctor`；Dyro 只再探测 PATH。
 
 **不要**做成 `dyro image generate …` 的计费封装。生图命令仍是 `local-image-gen`。
 
@@ -198,7 +208,7 @@ dyro --dry-run doctor              # 不得启动 local-image-gen
   "id": "local-image-gen",
   "optional": true,
   "state": "absent" | "needs_setup" | "ready" | "unavailable",
-  "version": "0.1.1",
+  "version": "0.1.4",
   "usable_providers": ["grok", "codex"]
 }
 ```
@@ -266,7 +276,7 @@ CLI 文案用中文，与现有 `dyro` 一致。
 ## 7. 验收清单（给 reviewer）
 
 - [ ] 未安装 wrapper 时，`dyro doctor` 仍成功，JSON `state=absent`
-- [ ] 已安装 wrapper 时，`dyro doctor --format json` 为 `state=present`，且**不**执行 `local-image-gen --doctor`
+- [ ] 已安装 wrapper 时，`dyro doctor --format json` 为 `state=present`，且**不**执行 `local-image-gen doctor`
 - [ ] `dyro --dry-run doctor` 与 `dyro --dry-run image doctor` 都不执行 `local-image-gen`
 - [ ] `dyro image doctor`：至少有一个订阅/Key 时 `state=ready`；无后端时 `needs_setup`，不是工作区 error
 - [ ] `dyro image doctor --format json` 默认不含路径、auth 文件、`api_base`
@@ -280,7 +290,7 @@ CLI 文案用中文，与现有 `dyro` 一致。
 
 ## 8. 给 Dyro agent 的开工顺序
 
-1. 读本文件 + 若本机有 wrapper，跑一遍 `local-image-gen --doctor` 看真实 JSON（注意 `login` 可能是路径）。
+1. 读本文件 + 若本机有 wrapper，跑一遍 `local-image-gen doctor` 看真实 JSON（注意 `login` 可能是路径）。
 2. 从 `origin/main` 开枝。定位 `cmd_doctor` 与 `_print_control_plane_json`，**不要**改 `workspace.doctor()` / `host doctor`。
 3. 落地阶段 B：`image doctor`（唯一 spawn）+ `image install`（remote_script_only）+ 单测。
 4. 落地阶段 A：`cmd_doctor` 的廉价 `which` + JSON `sidecars`。
